@@ -152,7 +152,7 @@ class SCOFFCell(tf.keras.layers.Layer):
         h_update = self.OF_communicate_step(h_tk, mask, training=training) # (batch_size, nf, OF_comm_value_size = units)
         h_update = h_update*mask + h_old*(1-mask) #?Do masked OFs participate in communication?
         
-        return h_update, h_update
+        return tf.reshape(h_update, [tf.shape(inputs)[0], self.units*self.nf]), (h_update)
         
     def OF_compete_step(self, inputs, hs, training=False):
         '''
