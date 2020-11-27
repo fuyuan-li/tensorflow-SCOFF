@@ -78,7 +78,7 @@ class FactorizedGRUCell(tf.keras.layers.Layer):
 
         h_tkj = h_tkj * tf.expand_dims(attention_score, axis=-1) # (batch_size, nf, ns, units)
         h_tk  = tf.reduce_mean(h_tkj, axis=2)
-        return h_tk, h_tk
+        return h_tk, (h_tk)
 
     @staticmethod
     def sample_gumbel(shape, eps=1e-20):
@@ -146,7 +146,7 @@ class SCOFFCell(tf.keras.layers.Layer):
         xx = tf.expand_dims(inputs, 1)
         ak, mask = self.OF_compete_step(xx, hs, training=training) # ak/mask of shape (batch_size, nf, OF_compete_value_size/1)
         
-        _, h_tk = self.rnn_cell(ak, hs)
+        _, h_tk = self.rnn_cell(ak, (hs,))
         h_tk = tf.stop_gradient(h_old*(1-mask)) + h_tk*mask
         
         h_update = self.OF_communicate_step(h_tk, mask, training=training) # (batch_size, nf, OF_comm_value_size = units)
