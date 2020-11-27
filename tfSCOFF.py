@@ -5,7 +5,8 @@ import numpy as np
 class FactorizedGRUCell(tf.keras.layers.Layer):
     
     def __init__(self, nf, ns, units, hypo_query_size,
-                 temperature=0.001, update_subset=True):
+                 temperature=0.001,
+                ):
         '''
         nf -- number of Object files
         ns -- number of Dynamics
@@ -18,7 +19,6 @@ class FactorizedGRUCell(tf.keras.layers.Layer):
         
         self.hypo_query_size = hypo_query_size
         self.temperature = temperature
-        self.update_subset = update_subset
         
     @property
     def state_size(self):
@@ -75,25 +75,9 @@ class FactorizedGRUCell(tf.keras.layers.Layer):
         qk = tf.einsum('bkh,bkjh->bkj', hypo_query, hypo_key) # (batch_size, nf, ns)
         r = self.sample_gumbel(tf.shape(qk))
         attention_score = tf.nn.softmax((qk+r) / self.temperature, axis=-1) # (batch_size, nf, ns-softmax)
-        
-        # Are we pick the hard top1? Or are we just using the softmax attention?
-        # Below is picking top1:
-        flatten_att = tf.reshape(attention_score, [-1, self.ns])
-        topk = tf.math.top_k(flatten_att, 1)
-        indices = topk.indices
-        mesh = tf.meshgrid( tf.range(indices.shape[1]), tf.range(tf.shape(indices)[0]) )[1]
-        full_indices = tf.reshape(tf.stack([mesh, indices], axis=-1), [-1,2])
-        sparse_tensor = tf.sparse.SparseTensor(indices=tf.cast(full_indices, tf.int64),
-                                      values=tf.ones(tf.shape(full_indices)[0]),
-                                      dense_shape=[tf.shape(flatten_att)[0],self.ns])
-        sparse_tensor = tf.sparse.reorder(sparse_tensor)
-        mask_ = tf.sparse.to_dense(sparse_tensor)
-        mask = tf.tile(tf.reshape(mask_, [-1, self.nf, self.ns, 1]), [1, 1, 1, sself.units]) # (batch_size, nf, ns, units)
-        
-        if self.update_subset:
-            h_tkj = mask*h_tkj + tf.stop_gradient(h_tkj*(1-mask))
-        
-        h_tk = tf.reduce_sum(h_tkj*mask, axis=2)
+
+        h_tkj = h_tkj * tf.expand_dims(attention_score, axis=-1) # (batch_size, nf, ns, units)
+        h_tk  = tf.reduce_mean(h_tkj, axis=2)
         return h_tk, h_tk
 
     @staticmethod
@@ -104,18 +88,19 @@ class FactorizedGRUCell(tf.keras.layers.Layer):
         U = tf.random.uniform(shape, minval=0, maxval=1)
         return -tf.math.log(-tf.math.log(U + eps) + eps)
 
+
 class SCOFFCell(tf.keras.layers.Layer):
-    def __init__(self, nf, ns, hypo_query_size,
+    def __init__(self, nf, topk, ns, hypo_query_size,
                  OF_comp_key_size, OF_comp_value_size, inp_heads,  inp_keep_prob,
                  OF_comm_key_size, OF_comm_value_size, comm_heads, comm_keep_prob,
-                 temperature=0.001, update_subset=True):
+                 temperature=0.001):
         super(SCOFFCell, self).__init__()
         self.nf = nf
+        self.topk = topk
         self.ns = ns
         self.units = OF_comm_value_size * comm_heads
         self.hypo_query_size = hypo_query_size
         self.temperature = temperature
-        self.update_subset = update_subset
         
         self.OF_comp_query_size = OF_comp_key_size
         self.OF_comp_key_size   = OF_comp_key_size
@@ -144,8 +129,7 @@ class SCOFFCell(tf.keras.layers.Layer):
                                           ns=self.ns, 
                                           units = self.units, 
                                           hypo_query_size = self.hypo_query_size, 
-                                          temperature = self.temperature, 
-                                          update_subset = self.update_subset)
+                                          temperature = self.temperature)
         
         self.OF_comm_query = tf.keras.layers.Dense(units=self.num_comm_heads*self.OF_comm_query_size, activation=None, use_bias=False)
         self.OF_comm_key   = tf.keras.layers.Dense(units=self.num_comm_heads*self.OF_comm_key_size,   activation=None, use_bias=False)
@@ -157,13 +141,15 @@ class SCOFFCell(tf.keras.layers.Layer):
         inputs of shape (batch_size, input_feature_size)
         states of shape (batch_size, nf, unitf)
         '''
-        hs = states # hs of shape (batch_size, nf, units)
+        hs = h_old = states # hs of shape (batch_size, nf, units)
         xx = tf.expand_dims(inputs, 1)
-        ak = self.OF_compete_step(xx, hs, training=training) # ak of shape (batch_size, nf, OF_compete_value_size*inp_heads)
+        ak, mask = self.OF_compete_step(xx, hs, training=training) # ak/mask of shape (batch_size, nf, OF_compete_value_size/1)
         
         _, h_tk = self.rnn_cell(ak, hs)
+        h_tk = tf.stop_gradient(h_old*(1-mask)) + h_tk*mask
         
-        h_update = self.OF_communicate_step(h_tk, training=training) # (batch_size, nf, OF_comm_value_size = units)
+        h_update = self.OF_communicate_step(h_tk, mask, training=training) # (batch_size, nf, OF_comm_value_size = units)
+        h_update = h_update*mask + h_old*(1-mask) #?Do masked OFs participate in communication?
         
         return h_update, h_update
         
@@ -180,21 +166,40 @@ class SCOFFCell(tf.keras.layers.Layer):
         kt = tf.stack(tf.split(kt, num_or_size_splits=self.num_input_heads, axis=-1), axis=1) # (batch_size, inp_heads,  1, OF_comm_key_size)
         vt = tf.stack(tf.split(vt, num_or_size_splits=self.num_input_heads, axis=-1), axis=1) # (batch_size, inp_heads,  1, OF_comm_value_size)
         qk = tf.stack(tf.split(qk, num_or_size_splits=self.num_input_heads, axis=-1), axis=1) # (batch_size, inp_heads, nf, OF_comm_query_size)
-        
+        vt = tf.reduce_mean(vt, axis=1) # (batch_size, 1, OF_comm_value_size)
         
         att = tf.matmul(qk, kt, transpose_b=True)/np.sqrt(self.OF_compete_key_size) # att (batch_size, inp_heads, nf, 1)
-        att_prob = tf.nn.softmax(att, axis = -2)  # att_prob (batch_size, inp_heads, nf-softmax, 1)
-        att_prob = self.input_attention_dropout(att_prob, training=training)
-        ak = tf.matmul(att_prob, vt) # ak of shape (batch_size, inp_heads, nf, OF_compete_value_size)
-        ak = tf.reshape(tf.transpose(ak, [0,2,1,3]), 
-                        [-1, self.nf, self.num_input_heads*self.OF_comp_value_size]) 
-                        # (batch_size, nf, OF_compete_value_size*inp_heads)
-        return ak
+        att = tf.reduce_mean(att, axis=1) # (batch_size, nf, 1)
+        att_prob = tf.nn.softmax(att, axis = -2)  # att_prob (batch_size, nf-softmax, 1)
         
-    def OF_communicate_step(self, h_tk, training=False):
+        # hard select topK OFs to update
+        if self.topk < self.nf:
+            signal_attention = tf.reshape(att_prob, [-1, self.nf])
+            topk = tf.math.top_k(signal_attention, self.topk)
+            indices = topk.indices
+            mesh = tf.meshgrid( tf.range(indices.shape[1]), tf.range(tf.shape(indices)[0]) )[1]
+            full_indices = tf.reshape(tf.stack([mesh, indices], axis=-1), [-1,2])
+            sparse_tensor = tf.sparse.SparseTensor(indices=tf.cast(full_indices, tf.int64),
+                                                  values=tf.ones(tf.shape(full_indices)[0]),
+                                                  dense_shape=[tf.shape(signal_attention)[0],self.nf])
+            sparse_tensor = tf.sparse.reorder(sparse_tensor)
+            mask_ = tf.sparse.to_dense(sparse_tensor)
+            mask  = tf.reshape(mask_, [-1, self.nf, 1]) #(batch_size, nf, 1)
+        else:
+            mask  = tf.ones_like(att_prob) #(batch_size, nf, 1)
+        # End hard select
+        
+        att_prob = self.input_attention_dropout(att_prob, training=training)
+        ak = tf.matmul(att_prob, vt) # ak of shape (batch_size, nf, OF_compete_value_size)
+        
+        ak = ak*mask
+        return ak, mask
+        
+    def OF_communicate_step(self, h_tk, mask, training=False):
         '''
         OFs communicate softmax
         h_tk of shape (batch_size, nf, units)
+        mask of shape (batch_size, nf, 1)
         '''
         qhat = self.OF_comm_query(h_tk) # (batch_size, nf, OF_comm_query_size*comm_heads)
         khat = self.OF_comm_key(h_tk)   # (batch_size, nf, OF_comm_key_size*comm_heads)
@@ -206,6 +211,8 @@ class SCOFFCell(tf.keras.layers.Layer):
         
         att = tf.matmul(qhat, khat, transpose_b=True)/np.sqrt(self.OF_comm_key_size) # (batch_size, comm_heads, nf, nf)
         att_prob = tf.nn.softmax(att, axis = -1) # (batch_size, comm_heads, nf, nf-softmax)
+        comm_mask = tf.expand_dims(mask, axis=1) # (batch_size, 1, nf, 1)
+        att_prob = att_prob*comm_mask
         att_prob = self.comm_attention_dropout(att_prob, training=training)
         delta_h = tf.matmul(att_prob, vhat) # (batch_size, comm_heads, nf, OF_comm_value_size)
         delta_h = tf.reshape(tf.transpose(delta_h, [0,2,1,3]), [-1, self.nf, self.units]) # (batch_size, nf, units)
