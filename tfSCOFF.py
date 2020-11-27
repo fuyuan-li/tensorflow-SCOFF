@@ -49,7 +49,7 @@ class FactorizedGRUCell(tf.keras.layers.Layer):
         '''
         
         x = inputs # (batch_size, nf, input_feature_size)
-        h = states # (batch_size, nf, units)
+        h, = states # (batch_size, nf, units)
         i2h = self.i2h_param # (ns, input_feature_size,   units*3)
         h2h = self.h2h_param # (ns, units,                units*3)
 
@@ -116,7 +116,7 @@ class SCOFFCell(tf.keras.layers.Layer):
         
     @property
     def state_size(self):
-        return tf.TensorShape([self.nf, self.unitf])
+        return tf.TensorShape([self.nf, self.units])
     
     def build(self, input_shape):
         
@@ -141,7 +141,8 @@ class SCOFFCell(tf.keras.layers.Layer):
         inputs of shape (batch_size, input_feature_size)
         states of shape (batch_size, nf, unitf)
         '''
-        hs = h_old = states # hs of shape (batch_size, nf, units)
+        hs, =states # hs of shape (batch_size, nf, units)
+        h_old = hs
         xx = tf.expand_dims(inputs, 1)
         ak, mask = self.OF_compete_step(xx, hs, training=training) # ak/mask of shape (batch_size, nf, OF_compete_value_size/1)
         
@@ -168,7 +169,7 @@ class SCOFFCell(tf.keras.layers.Layer):
         qk = tf.stack(tf.split(qk, num_or_size_splits=self.num_input_heads, axis=-1), axis=1) # (batch_size, inp_heads, nf, OF_comm_query_size)
         vt = tf.reduce_mean(vt, axis=1) # (batch_size, 1, OF_comm_value_size)
         
-        att = tf.matmul(qk, kt, transpose_b=True)/np.sqrt(self.OF_compete_key_size) # att (batch_size, inp_heads, nf, 1)
+        att = tf.matmul(qk, kt, transpose_b=True)/np.sqrt(self.OF_comp_key_size) # att (batch_size, inp_heads, nf, 1)
         att = tf.reduce_mean(att, axis=1) # (batch_size, nf, 1)
         att_prob = tf.nn.softmax(att, axis = -2)  # att_prob (batch_size, nf-softmax, 1)
         
