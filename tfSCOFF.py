@@ -142,57 +142,53 @@ class SCOFFCell(tf.keras.layers.Layer):
         states of shape (batch_size, nf, unitf)
         '''
         hs, =states # hs of shape (batch_size, nf, units)
-        h_old = hs
-        xx = tf.expand_dims(inputs, 1)
-        ak, mask = self.OF_compete_step(xx, hs, training=training) # ak/mask of shape (batch_size, nf, OF_compete_value_size/1)
+        h_old = hs*1.0
+        ak, mask = self.OF_compete_step(inputs, hs, training=training)   # ak/mask of shape (batch_size, nf, OF_compete_value_size/1)
         
         _, h_tk = self.rnn_cell(ak, (hs,))
-        h_tk = tf.stop_gradient(h_old*(1-mask)) + h_tk*mask
+        h_tk = tf.stop_gradient(h_tk*(1-mask)) + h_tk*mask
         
-        h_update = self.OF_communicate_step(h_tk, mask, training=training) # (batch_size, nf, OF_comm_value_size = units)
-        h_update = h_update*mask + h_old*(1-mask) #?Do masked OFs participate in communication?
+        h_comm = self.OF_communicate_step(h_tk, mask, training=training) # (batch_size, nf, OF_comm_value_size = units)
+        h_update = h_comm*mask + h_old*(1-mask)                          ##?Do masked OFs participate in communication?
         
         return tf.reshape(h_update, [tf.shape(inputs)[0], self.units*self.nf]), (h_update)
         
-    def OF_compete_step(self, inputs, hs, training=False):
+    def OF_compete_step(self, x, hs, training=False):
         '''
         OFs softmax to read from inputs
-        xx of shape (batch_size, 1,  input_feature_size)
+        x  of shape (batch_size, input_feature_size)
         hs of shape (batch_size, nf, unitf)
         '''
+        xx = tf.stack([x, tf.zeros_like(x)], axis=1)
         qk = self.OF_comp_query(hs)     # qk of shape (batch_size, nf, OF_compete_query_size*inp_heads)
-        kt = self.OF_comp_key(inputs)   # kt of shape (batch_size, 1,  OF_compete_key_size*inp_heads)
-        vt = self.OF_comp_value(inputs) # vt of shape (batch_size, 1,  OF_compete_value_size*inp_heads)
+        kt = self.OF_comp_key(xx)       # kt of shape (batch_size, 2,  OF_compete_key_size*inp_heads)
+        vt = self.OF_comp_value(xx)     # vt of shape (batch_size, 2,  OF_compete_value_size*inp_heads)
         
-        kt = tf.stack(tf.split(kt, num_or_size_splits=self.num_input_heads, axis=-1), axis=1) # (batch_size, inp_heads,  1, OF_comm_key_size)
-        vt = tf.stack(tf.split(vt, num_or_size_splits=self.num_input_heads, axis=-1), axis=1) # (batch_size, inp_heads,  1, OF_comm_value_size)
+        kt = tf.stack(tf.split(kt, num_or_size_splits=self.num_input_heads, axis=-1), axis=1) # (batch_size, inp_heads,  2, OF_comm_key_size)
+        vt = tf.stack(tf.split(vt, num_or_size_splits=self.num_input_heads, axis=-1), axis=1) # (batch_size, inp_heads,  2, OF_comm_value_size)
         qk = tf.stack(tf.split(qk, num_or_size_splits=self.num_input_heads, axis=-1), axis=1) # (batch_size, inp_heads, nf, OF_comm_query_size)
         vt = tf.reduce_mean(vt, axis=1) # (batch_size, 1, OF_comm_value_size)
         
-        att = tf.matmul(qk, kt, transpose_b=True)/np.sqrt(self.OF_comp_key_size) # att (batch_size, inp_heads, nf, 1)
-        att = tf.reduce_mean(att, axis=1) # (batch_size, nf, 1)
-        att_prob = tf.nn.softmax(att, axis = -2)  # att_prob (batch_size, nf-softmax, 1)
+        att1 = tf.matmul(qk, kt, transpose_b=True)/np.sqrt(self.OF_comp_key_size) # att (batch_size, inp_heads, nf, 2)
+        att2 = tf.reduce_mean(att1, axis=1) # (batch_size, nf, 2)
+        att_prob = tf.nn.softmax(att2, axis = -1)  # att_prob (batch_size, nf, 2)
         
         # hard select topK OFs to update
-        if self.topk < self.nf:
-            signal_attention = tf.reshape(att_prob, [-1, self.nf])
-            topk = tf.math.top_k(signal_attention, self.topk)
-            indices = topk.indices
-            mesh = tf.meshgrid( tf.range(indices.shape[1]), tf.range(tf.shape(indices)[0]) )[1]
-            full_indices = tf.reshape(tf.stack([mesh, indices], axis=-1), [-1,2])
-            sparse_tensor = tf.sparse.SparseTensor(indices=tf.cast(full_indices, tf.int64),
-                                                  values=tf.ones(tf.shape(full_indices)[0]),
-                                                  dense_shape=[tf.shape(signal_attention)[0],self.nf])
-            sparse_tensor = tf.sparse.reorder(sparse_tensor)
-            mask_ = tf.sparse.to_dense(sparse_tensor)
-            mask  = tf.reshape(mask_, [-1, self.nf, 1]) #(batch_size, nf, 1)
-        else:
-            mask  = tf.ones_like(att_prob) #(batch_size, nf, 1)
+        signal_attention = att2[:,:,0]  # (batch_size, nf)
+        topk = tf.math.top_k(signal_attention, self.topk)
+        indices = topk.indices
+        mesh = tf.meshgrid( tf.range(indices.shape[1]), tf.range(tf.shape(indices)[0]) )[1]
+        full_indices = tf.reshape(tf.stack([mesh, indices], axis=-1), [-1,2])
+        sparse_tensor = tf.sparse.SparseTensor(indices=tf.cast(full_indices, tf.int64),
+                                              values=tf.ones(tf.shape(full_indices)[0]),
+                                              dense_shape=[tf.shape(signal_attention)[0],self.nf])
+        sparse_tensor = tf.sparse.reorder(sparse_tensor)
+        mask_ = tf.sparse.to_dense(sparse_tensor)
+        mask  = tf.expand_dims(mask_, axis=-1) #(batch_size, nf, 1)
         # End hard select
         
-        att_prob = self.input_attention_dropout(att_prob, training=training)
+        att_prob = self.input_attention_dropout(att_prob, training=training)    
         ak = tf.matmul(att_prob, vt) # ak of shape (batch_size, nf, OF_compete_value_size)
-        
         ak = ak*mask
         return ak, mask
         
@@ -220,4 +216,4 @@ class SCOFFCell(tf.keras.layers.Layer):
         out = h_tk+delta_h
         return out
              
-
+             
